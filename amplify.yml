@@ -1,0 +1,29 @@
+# AWS Amplify Hosting build spec.
+#
+# Amplify watches the connected branch and builds on push, so the frontend has
+# no GitHub Actions deploy job -- the "CI/CD" for this half is Amplify itself.
+# The backend deploy lives in .github/workflows/deploy.yml.
+#
+# Set NEXT_PUBLIC_API_URL and NEXT_PUBLIC_COGNITO_* per branch in the Amplify
+# console under Environment variables. Never put a secret in a NEXT_PUBLIC_*
+# variable: they are inlined into the client bundle.
+version: 1
+applications:
+  - appRoot: frontend
+    frontend:
+      phases:
+        preBuild:
+          commands:
+            - npm ci
+        build:
+          commands:
+            - npm run typecheck
+            - npm run build
+      artifacts:
+        baseDirectory: .next
+        files:
+          - "**/*"
+      cache:
+        paths:
+          - node_modules/**/*
+          - .next/cache/**/*
