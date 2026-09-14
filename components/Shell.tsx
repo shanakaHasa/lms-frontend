@@ -14,14 +14,18 @@ import { useEffect, type ReactNode } from "react";
 import { useAuth } from "@/lib/auth";
 
 export default function Shell({ children }: { children: ReactNode }) {
-  const { session, signOut } = useAuth();
+  const { session, ready, signOut } = useAuth();
   const router = useRouter();
   const pathname = usePathname();
 
   useEffect(() => {
-    if (!session) router.replace("/login");
-  }, [session, router]);
+    // Wait for the restore attempt. Redirecting before it finishes would bounce
+    // a signed-in user to the login screen on every reload -- which is exactly
+    // the problem the refresh cookie exists to solve.
+    if (ready && !session) router.replace("/login");
+  }, [ready, session, router]);
 
+  if (!ready) return <div className="centre muted">Restoring session…</div>;
   if (!session) return null;
 
   const links = [
@@ -50,7 +54,7 @@ export default function Shell({ children }: { children: ReactNode }) {
         <span className="muted">
           {session.user.fullName ?? session.user.email} · {session.user.tenantSlug}
         </span>
-        <button className="link" onClick={signOut}>
+        <button className="link" onClick={() => void signOut()}>
           Sign out
         </button>
       </nav>

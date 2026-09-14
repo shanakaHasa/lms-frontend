@@ -1,39 +1,37 @@
 "use client";
 
 /**
- * Session state, and the one decision in this file that matters.
+ * Session state.
  *
- * **The access token is held in memory only.** Not localStorage, not
- * sessionStorage, not a readable cookie. Anything reachable from JavaScript is
- * reachable from any script that gets injected into the page, and an access
- * token is a bearer credential — whoever holds it *is* the user until it
- * expires.
+ * **The access token is held in memory. The refresh token is an httpOnly cookie
+ * this code cannot read.** That split is the whole design: the short-lived
+ * credential lives where a reload loses it, and the long-lived one lives where
+ * script cannot reach it at all — so an injected script can steal at most the
+ * remainder of a ten-minute token, and cannot mint itself a new session.
  *
- * The cost is real and worth stating: a hard browser refresh loses the session
- * and returns you to the login screen. That is not a bug, and it is not the
- * final design either. The auth service is already built for the standard
- * pattern — access token in memory, refresh token in an httpOnly `__Host-`
- * cookie the page cannot read — and `refresh_tokens`, the cookie names and the
- * rotation rules all exist in the schema. Only the endpoint is unbuilt (Step 6).
- * When it lands, `restore()` below starts calling it and the refresh survives.
+ * A reload now survives, because `restore()` asks the server to rotate the
+ * cookie into a fresh access token. Nothing is read from localStorage at any
+ * point; if it were, the cookie being httpOnly would be pointless.
  *
- * Storing the token in localStorage today would make the refresh problem go
- * away and quietly make every XSS a full account takeover. That trade is not
- * worth a page reload.
+ * Every call here sends `credentials: "include"`, without which the browser
+ * would not attach the cookie to a cross-origin request and refresh would
+ * silently never work.
  */
 
 import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
 
 export type Session = {
   accessToken: string;
-  expiresAt: number; // epoch ms
+  expiresAt: number;
   user: {
     userId: string;
     email: string;
@@ -45,54 +43,136 @@ export type Session = {
 
 type AuthState = {
   session: Session | null;
+  /** Null until the first restore attempt finishes, so the UI can avoid
+   *  flashing the login screen at someone who is still signed in. */
+  ready: boolean;
   signIn: (email: string, password: string, tenantSlug: string) => Promise<void>;
-  signOut: () => void;
-  /** Scope checks mirror the server's. The server is still the authority — this
-   *  only decides whether to render a control the user cannot use. */
+  signOut: () => Promise<void>;
   can: (scope: string) => boolean;
 };
 
 const AuthContext = createContext<AuthState | null>(null);
-
 const AUTH_URL = process.env.NEXT_PUBLIC_AUTH_URL ?? "http://localhost:8001";
+
+/** Refresh this long before expiry, so a request never races the clock. */
+const REFRESH_MARGIN_MS = 60_000;
+
+/**
+ * Read the display fields out of an access token.
+ *
+ * Decoded, **not verified** — and that distinction matters. The server verifies
+ * the signature on every request; this only unpacks a name and a tenant to put
+ * in the header. Nothing here is an authorization decision, and the scope list
+ * it returns is used solely to avoid rendering controls that would 403.
+ */
+function readClaims(token: string): Session["user"] | null {
+  try {
+    const payload = JSON.parse(
+      atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")),
+    );
+    return {
+      userId: payload.sub,
+      email: payload.email ?? "",
+      fullName: null,
+      tenantSlug: payload.tsl ?? "",
+      scopes: String(payload.scope ?? "").split(" ").filter(Boolean),
+    };
+  } catch {
+    return null;
+  }
+}
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
+  const [ready, setReady] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const applyToken = useCallback(
+    (accessToken: string, expiresIn: number, user: Session["user"]) => {
+      setSession({ accessToken, expiresAt: Date.now() + expiresIn * 1000, user });
+    },
+    [],
+  );
+
+  const refresh = useCallback(async (): Promise<boolean> => {
+    const response = await fetch(`${AUTH_URL}/api/v1/auth/refresh`, {
+      method: "POST",
+      credentials: "include",
+    });
+    if (!response.ok) return false;
+
+    const data = await response.json();
+    const claims = readClaims(data.token.access_token);
+    if (!claims) return false;
+
+    applyToken(data.token.access_token, data.token.expires_in, claims);
+    return true;
+  }, [applyToken]);
+
+  // On mount, try to turn the cookie back into a session. This is what makes a
+  // page reload survive without the token ever touching disk.
+  useEffect(() => {
+    void refresh().finally(() => setReady(true));
+  }, [refresh]);
+
+  // Rotate shortly before expiry. Without this the first request after ten
+  // minutes fails, and the user sees an error rather than a working page.
+  useEffect(() => {
+    if (timer.current) clearTimeout(timer.current);
+    if (!session) return;
+
+    const delay = Math.max(session.expiresAt - Date.now() - REFRESH_MARGIN_MS, 5_000);
+    timer.current = setTimeout(() => {
+      void refresh().then((ok) => {
+        // A failed refresh means the family was revoked -- logout elsewhere, a
+        // password change, or reuse detection. Dropping the session sends the
+        // user to sign in again, which is the correct response.
+        if (!ok) setSession(null);
+      });
+    }, delay);
+
+    return () => {
+      if (timer.current) clearTimeout(timer.current);
+    };
+  }, [session, refresh]);
 
   const signIn = useCallback(
     async (email: string, password: string, tenantSlug: string) => {
       const response = await fetch(`${AUTH_URL}/api/v1/auth/login`, {
         method: "POST",
+        credentials: "include",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ email, password, tenant_slug: tenantSlug }),
       });
 
       if (!response.ok) {
-        // The server returns one message for every failure — unknown
-        // institution, unknown user, wrong password, disabled account. Showing
-        // anything more specific here would undo that on the client, so the
-        // body is passed through unchanged.
+        // The server returns one message for every failure mode so a client
+        // cannot enumerate which addresses exist. Passed through unchanged.
         const body = await response.json().catch(() => null);
         throw new Error(body?.error?.message ?? "Sign-in failed.");
       }
 
       const data = await response.json();
-      setSession({
-        accessToken: data.token.access_token,
-        expiresAt: Date.now() + data.token.expires_in * 1000,
-        user: {
-          userId: data.user.user_id,
-          email: data.user.email,
-          fullName: data.user.full_name,
-          tenantSlug: data.user.tenant_slug,
-          scopes: data.user.scopes,
-        },
+      applyToken(data.token.access_token, data.token.expires_in, {
+        userId: data.user.user_id,
+        email: data.user.email,
+        fullName: data.user.full_name,
+        tenantSlug: data.user.tenant_slug,
+        scopes: data.user.scopes,
       });
     },
-    [],
+    [applyToken],
   );
 
-  const signOut = useCallback(() => setSession(null), []);
+  const signOut = useCallback(async () => {
+    // Server-side first: revoking the family is what actually ends the session.
+    // Clearing local state alone would leave a usable refresh cookie behind.
+    await fetch(`${AUTH_URL}/api/v1/auth/logout`, {
+      method: "POST",
+      credentials: "include",
+    }).catch(() => undefined);
+    setSession(null);
+  }, []);
 
   const can = useCallback(
     (scope: string) => session?.user.scopes.includes(scope) ?? false,
@@ -100,8 +180,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const value = useMemo(
-    () => ({ session, signIn, signOut, can }),
-    [session, signIn, signOut, can],
+    () => ({ session, ready, signIn, signOut, can }),
+    [session, ready, signIn, signOut, can],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
