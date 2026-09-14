@@ -1,91 +1,140 @@
-import type { StreamEvent } from "./types";
+/**
+ * The LMS API client.
+ *
+ * One rule runs through it: **the token is passed in, never read from storage.**
+ * A module that reached into `localStorage` on its own would make the storage
+ * decision in `auth.tsx` unenforceable — any call site could quietly persist a
+ * token to make its own life easier.
+ *
+ * Errors are unwrapped into a typed shape rather than surfaced as raw text. The
+ * server returns `{error: {code, message, field?}, request_id}`, and `field` is
+ * what lets a form highlight the input that clashed instead of showing a banner
+ * that says "conflict".
+ */
+
+import type { Course, Enrolment, Page, RosterEntry, Student } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
-/**
- * Stream a chat answer.
- *
- * EventSource is not used here even though this is SSE: EventSource only does
- * GET and cannot send an Authorization header. fetch + a manual SSE parse gives
- * us POST, bearer auth, and an AbortSignal that actually cancels the request --
- * which is what stops a token bill when the user navigates away.
- */
-export async function* streamChat(
-  question: string,
-  options: {
-    conversationId?: string | null;
-    token?: string | null;
-    signal?: AbortSignal;
-  } = {},
-): AsyncGenerator<StreamEvent> {
-  const response = await fetch(`${API_URL}/api/v1/chat/stream`, {
-    method: "POST",
+export class ApiFailure extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string,
+    readonly field?: string,
+    readonly requestId?: string | null,
+  ) {
+    super(message);
+    this.name = "ApiFailure";
+  }
+}
+
+async function request<T>(
+  path: string,
+  token: string,
+  init: RequestInit = {},
+): Promise<T> {
+  const response = await fetch(`${API_URL}${path}`, {
+    ...init,
     headers: {
-      "content-type": "application/json",
-      ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
+      ...(init.body ? { "content-type": "application/json" } : {}),
+      authorization: `Bearer ${token}`,
+      ...init.headers,
     },
-    body: JSON.stringify({
-      question,
-      conversation_id: options.conversationId ?? null,
+  });
+
+  if (response.status === 204) return undefined as T;
+
+  const body = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new ApiFailure(
+      body?.error?.message ?? `Request failed (${response.status})`,
+      response.status,
+      body?.error?.code ?? "unknown",
+      body?.error?.field,
+      body?.request_id,
+    );
+  }
+  return body as T;
+}
+
+function query(params: Record<string, string | number | undefined>): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== "") search.set(key, String(value));
+  }
+  const rendered = search.toString();
+  return rendered ? `?${rendered}` : "";
+}
+
+// ── Students ───────────────────────────────────────────────────────────────
+
+export const students = {
+  list: (token: string, opts: { q?: string; limit?: number; offset?: number } = {}) =>
+    request<Page<Student>>(
+      `/api/v1/students${query({ q: opts.q, limit: opts.limit ?? 25, offset: opts.offset ?? 0 })}`,
+      token,
+    ),
+
+  create: (
+    token: string,
+    input: {
+      student_number: string;
+      first_name: string;
+      last_name: string;
+      email: string;
+      year_level?: number | null;
+    },
+  ) =>
+    request<Student>("/api/v1/students", token, {
+      method: "POST",
+      body: JSON.stringify(input),
     }),
-    signal: options.signal,
-  });
 
-  if (!response.ok || !response.body) {
-    const detail = await response.text().catch(() => "");
-    throw new Error(`Chat request failed (${response.status}). ${detail}`.trim());
-  }
+  // Soft on the server: the row survives so enrolments still resolve to a
+  // person, and the student number becomes reusable.
+  remove: (token: string, id: string) =>
+    request<void>(`/api/v1/students/${id}`, token, { method: "DELETE" }),
+};
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+// ── Courses ────────────────────────────────────────────────────────────────
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+export const courses = {
+  list: (token: string, opts: { q?: string; limit?: number } = {}) =>
+    request<Page<Course>>(
+      `/api/v1/courses${query({ q: opts.q, limit: opts.limit ?? 50 })}`,
+      token,
+    ),
 
-    // SSE frames are separated by a blank line. A partial frame stays in the
-    // buffer until the rest of it arrives.
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary !== -1) {
-      const frame = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      const parsed = parseFrame(frame);
-      if (parsed) yield parsed;
-      boundary = buffer.indexOf("\n\n");
-    }
-  }
-}
+  create: (
+    token: string,
+    input: { code: string; title: string; term?: string | null; credits?: number | null },
+  ) =>
+    request<Course>("/api/v1/courses", token, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
 
-function parseFrame(frame: string): StreamEvent | null {
-  const dataLines: string[] = [];
-  let eventName = "message";
+  roster: (token: string, courseId: string) =>
+    request<Page<RosterEntry>>(`/api/v1/courses/${courseId}/roster?limit=100`, token),
+};
 
-  for (const line of frame.split("\n")) {
-    if (line.startsWith(":")) continue; // keep-alive ping
-    if (line.startsWith("event:")) eventName = line.slice(6).trim();
-    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
-  }
-  if (dataLines.length === 0) return null;
+// ── Enrolments ─────────────────────────────────────────────────────────────
 
-  try {
-    const payload = JSON.parse(dataLines.join("\n"));
-    return { type: eventName, ...payload } as StreamEvent;
-  } catch {
-    return null;
-  }
-}
+export const enrolments = {
+  /**
+   * Idempotent on the server: 201 for a new enrolment, 200 if one already
+   * existed. Both are successes, so this does not distinguish them — a UI that
+   * treated a repeat as an error would be wrong about what happened.
+   */
+  create: (token: string, studentId: string, courseId: string) =>
+    request<Enrolment>("/api/v1/enrolments", token, {
+      method: "POST",
+      body: JSON.stringify({ student_id: studentId, course_id: courseId }),
+    }),
 
-export async function searchDocuments(query: string, token?: string | null) {
-  const response = await fetch(`${API_URL}/api/v1/chat/search`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
-    },
-    body: JSON.stringify({ query }),
-  });
-  if (!response.ok) throw new Error(`Search failed (${response.status})`);
-  return response.json();
-}
+  /** Withdraws — the server keeps the row and changes its status. */
+  withdraw: (token: string, enrolmentId: string) =>
+    request<void>(`/api/v1/enrolments/${enrolmentId}`, token, { method: "DELETE" }),
+};

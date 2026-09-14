@@ -1,16 +1,18 @@
-import Chat from "@/components/Chat";
+"use client";
 
+import { useRouter } from "next/navigation";
+import { useEffect } from "react";
+
+import { useAuth } from "@/lib/auth";
+
+/** Nothing lives at the root — it only decides where you belong. */
 export default function Home() {
-  return (
-    <main className="shell">
-      <header className="shell__header">
-        <h1>ClinicRAG</h1>
-        <p>
-          Answers are drawn only from this practice&rsquo;s uploaded documents, with a
-          citation for every clinical claim.
-        </p>
-      </header>
-      <Chat />
-    </main>
-  );
+  const { session } = useAuth();
+  const router = useRouter();
+
+  useEffect(() => {
+    router.replace(session ? "/students" : "/login");
+  }, [session, router]);
+
+  return null;
 }

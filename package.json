@@ -1,12 +1,12 @@
 {
-  "name": "clinic-rag-web",
+  "name": "lms-web",
   "version": "0.1.0",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3000",
     "build": "next build",
     "start": "next start -p 3000",
-    "lint": "next lint",
+    "lint": "node -e \"process.env.ESLINT_USE_FLAT_CONFIG='false';require('child_process').execSync('next lint',{stdio:'inherit',env:process.env})\"",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -21,5 +21,6 @@
     "eslint": "9.17.0",
     "eslint-config-next": "15.1.0",
     "typescript": "5.7.2"
-  }
+  },
+  "description": "TeachAssist LMS \u2014 admin and teacher console"
 }

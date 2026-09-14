@@ -1,17 +1,21 @@
 import type { Metadata } from "next";
+
+import { AuthProvider } from "@/lib/auth";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "ClinicRAG",
-  description: "Ask questions about your practice's clinical documents",
+  title: "TeachAssist",
+  description: "Manage students, courses and enrolments",
 };
 
 export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en-AU">
-      <body>{children}</body>
+    <html lang="en">
+      <body>
+        <AuthProvider>{children}</AuthProvider>
+      </body>
     </html>
   );
 }
