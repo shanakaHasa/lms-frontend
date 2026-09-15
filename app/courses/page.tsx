@@ -56,7 +56,13 @@ export default function CoursesPage() {
   async function onCreate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!token) return;
-    const form = new FormData(event.currentTarget);
+
+    // See the note in app/students/page.tsx: `currentTarget` is null after the
+    // first await, so the element is captured while the handler is still
+    // synchronous.
+    const formEl = event.currentTarget;
+    const form = new FormData(formEl);
+
     setBusy(true);
     try {
       await courses.create(token, {
@@ -65,14 +71,17 @@ export default function CoursesPage() {
         term: (form.get("term") as string) || null,
         credits: form.get("credits") ? Number(form.get("credits")) : null,
       });
-      event.currentTarget.reset();
-      setError(null);
-      await load();
     } catch (failure) {
       setError(failure);
+      return;
     } finally {
       setBusy(false);
     }
+
+    // The course exists from here on; a later failure is not a create failure.
+    formEl.reset();
+    setError(null);
+    await load();
   }
 
   async function onEnrol(studentId: string) {

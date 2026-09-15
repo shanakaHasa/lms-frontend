@@ -46,7 +46,14 @@ export default function StudentsPage() {
   async function onCreate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!token) return;
-    const form = new FormData(event.currentTarget);
+
+    // Captured BEFORE the first await. React nulls `currentTarget` once this
+    // handler returns synchronously, and everything below the await runs after
+    // that -- so reading it later throws. Note the FormData line is fine for
+    // exactly the same reason it is fine: it runs before any await.
+    const formEl = event.currentTarget;
+    const form = new FormData(formEl);
+
     setBusy(true);
     try {
       await students.create(token, {
@@ -56,14 +63,22 @@ export default function StudentsPage() {
         email: String(form.get("email")),
         year_level: form.get("year_level") ? Number(form.get("year_level")) : null,
       });
-      event.currentTarget.reset();
-      setError(null);
-      await load(search);
     } catch (failure) {
+      // Only a genuine write failure reaches here.
       setError(failure);
+      return;
     } finally {
       setBusy(false);
     }
+
+    // Past this point the student EXISTS. Nothing below may be reported as a
+    // creation failure -- doing so would tell the user their record was not
+    // saved when it was, and the natural retry then hits a 409 on the student
+    // number, which looks like an unrelated problem. `load` surfaces its own
+    // errors.
+    formEl.reset();
+    setError(null);
+    await load(search);
   }
 
   async function onDelete(id: string) {
